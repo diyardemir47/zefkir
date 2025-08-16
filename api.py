@@ -1,16 +1,28 @@
+# api.py (GÜNCEL)
+import os
 import cv2
 import mediapipe as mp
 import numpy as np
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, current_app
 import traceback
 import gc
 from sklearn.cluster import MiniBatchKMeans
+import base64
+from io import BytesIO
 
-DEBUG = False
+# Debug flag from env
+DEBUG = os.environ.get('DEBUG', 'False').lower() in ('1', 'true', 'yes')
 
-# ===================================================================
-# 1. YÜZ ANALİZİ FONKSİYONLARI (GÜNCEL VERSİYON)
-# ===================================================================
+# -------------------------------------------------------------------
+# 0. App config ve limitler
+# -------------------------------------------------------------------
+MAX_UPLOAD_MB = int(os.environ.get('MAX_UPLOAD_MB', 2))  # default 2 MB
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_MB * 1024 * 1024
+
+# -------------------------------------------------------------------
+# 1. YÜZ ANALİZİ FONKSİYONLARI (SENİN ORJİNAL KODUNUN KORUNMUŞ HALİ)
+# -------------------------------------------------------------------
 
 def detect_skin_tone(image, landmarks):
     try:
@@ -162,42 +174,30 @@ def analyze_hair_status(image, landmarks, skin_bgr, debug=False):
         if debug or DEBUG: print("analyze_hair_status error:", e)
         return "Belirsiz"
 
-
 def detect_hair_texture(image, landmarks, debug=False):
-    """
-    Saçın dokusunu (düz, dalgalı, kıvırcık) belirler.
-    """
     try:
         h, w = image.shape[:2]
-        # Yüz çevresinde saç bölgesi
         y1 = max(0, int(landmarks[10].y * h - 20))
         y2 = int(landmarks[152].y * h)
         x1 = max(0, int(landmarks[127].x * w))
         x2 = min(w, int(landmarks[356].x * w))
         roi = image[y1:y2, x1:x2]
-        
         if roi.size < 500:
             return "Belirsiz"
-            
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        
-        # Laplace filtresi ile kenar ve doku tespiti
         laplacian = cv2.Laplacian(gray, cv2.CV_64F)
         lap_var = laplacian.var()
-        
         if debug or DEBUG:
             print("Laplacian Variance:", lap_var)
-            
-        if lap_var > 300: # Yüksek varyans kıvırcık saçı işaret eder
+        if lap_var > 300:
             return "Kıvırcık"
-        elif lap_var > 100: # Orta seviye varyans dalgalı saçı işaret eder
+        elif lap_var > 100:
             return "Dalgalı"
-        else: # Düşük varyans düz saçı işaret eder
+        else:
             return "Düz"
     except Exception as e:
         if DEBUG: print(f"Hata detect_hair_texture: {e}")
         return "Belirsiz"
-
 
 def detect_nose_shape(landmarks, width, height):
     try:
@@ -216,7 +216,6 @@ def detect_nose_shape(landmarks, width, height):
         if DEBUG: print(f"Hata detect_nose_shape: {e}")
         return "Belirsiz"
 
-
 def detect_eyebrow_shape(landmarks):
     try:
         ys_left = [landmarks[i].y for i in [70,63,105,66,107]]
@@ -234,7 +233,6 @@ def detect_eyebrow_shape(landmarks):
         if DEBUG: print(f"Hata detect_eyebrow_shape: {e}")
         return "Belirsiz"
 
-
 def detect_eye_shape(landmarks, width, height):
     try:
         top = landmarks[159]; bot = landmarks[145]; left = landmarks[33]; right = landmarks[133]
@@ -248,89 +246,57 @@ def detect_eye_shape(landmarks, width, height):
         if DEBUG: print(f"Hata detect_eye_shape: {e}")
         return "Belirsiz"
 
-
 def detect_lip_thickness(landmarks, height):
-    """
-    Dudakların kalınlığını belirler.
-    """
     try:
-        # Üst dudak ve alt dudak arasındaki mesafe
         top_lip_upper = landmarks[13]
         top_lip_lower = landmarks[14]
-        
-        # Üst dudak kalınlığı
         upper_lip_thickness = (top_lip_lower.y - top_lip_upper.y) * height
-        
-        # Alt dudak kalınlığı
         bottom_lip_upper = landmarks[12]
         bottom_lip_lower = landmarks[15]
-        
         lower_lip_thickness = (bottom_lip_lower.y - bottom_lip_upper.y) * height
-        
         avg_thickness = (upper_lip_thickness + lower_lip_thickness) / 2
-        
-        # Yüzün toplam yüksekliği ile normalize edilmiş oran
         face_height = (landmarks[152].y - landmarks[10].y) * height
         thickness_ratio = avg_thickness / face_height if face_height > 0 else 0
-        
         if DEBUG:
             print("Lip thickness ratio:", thickness_ratio)
-            
         if thickness_ratio > 0.08:
             return "Kalın"
         elif thickness_ratio > 0.05:
             return "Orta kalınlıkta"
         else:
             return "İnce"
-            
     except Exception as e:
         if DEBUG: print(f"Hata detect_lip_thickness: {e}")
         return "Belirsiz"
 
-# EKSİK OLAN YÜZ UZUNLUĞU FONKSİYONU BURAYA EKLENDİ
 def detect_face_length_ratio(landmarks, width, height):
-    """
-    Yüzün uzunluk oranını belirler.
-    """
     try:
-        # Yüzün en üst (alın) ve en alt (çene) noktaları
         top_face = landmarks[10]
         bottom_face = landmarks[152]
-        # Yüzün en sol ve en sağ noktaları
         left_face = landmarks[234]
         right_face = landmarks[454]
-        
         face_height = (bottom_face.y - top_face.y) * height
         face_width = (right_face.x - left_face.x) * width
-        
         if face_width <= 0: return "Belirsiz"
-        
         ratio = face_height / face_width
-        
         if DEBUG:
             print("Face Length Ratio:", ratio)
-        
         if ratio > 1.4:
             return "Uzun"
         elif ratio > 1.2:
             return "Orta"
         else:
             return "Kısa"
-            
     except Exception as e:
         if DEBUG: print(f"Hata detect_face_length_ratio: {e}")
         return "Belirsiz"
 
-
-# ===================================================================
-# 2. GENİŞLETİLMİŞ SINIFLANDIRICI
-# ===================================================================
+# -------------------------------------------------------------------
+# 2. SINIFLANDIRMA FONKSİYONLARI (orijinal korundu)
+# -------------------------------------------------------------------
 
 def classify_phenotype(features):
-    """
-    features: dict -- örn: {'Ten':..., 'Göz':..., 'Saç':..., ...}
-    Döner: main, sub, region, conf_main, conf_sub
-    """
+    # categories truncated for brevity in explanation — full mapping kept as in original (kept below)
     categories = {
         'Kafkas': {'kurallar': {
             'Ten': ['Beyaz', 'Açık Buğday', 'Buğday'],
@@ -391,6 +357,7 @@ def classify_phenotype(features):
             }}
         }}
     }
+
     def compute_score_for_cat(cat_rules):
         total_keys = len(cat_rules)
         if total_keys == 0: return 0.0, []
@@ -405,7 +372,7 @@ def classify_phenotype(features):
                 matched_keys.append(key)
         score = matched / total_keys
         return score, matched_keys
-    
+
     main_scores = {}; main_matches = {}
     for cat_name, cat in categories.items():
         score, matched_keys = compute_score_for_cat(cat.get('kurallar', {}))
@@ -443,11 +410,7 @@ def classify_phenotype(features):
     conf_main = round(best_score,2)
     return best_main, best_sub, sub_region, conf_main, conf_sub
 
-
 def classify_turkish_phenotype(features):
-    """
-    Gönderilen verilere göre Türkiye'ye özgü fenotipleri sınıflandırır.
-    """
     turkish_phenotypes = {
         'TÜRK': {
             'puan': 0, 'açıklama': 'Yörük, Tatar, Anadolu Türkmeni, Manav',
@@ -568,91 +531,192 @@ def classify_turkish_phenotype(features):
     best_score = scores[best_phenotype]
     total_score = sum(scores.values())
     confidence = best_score / total_score if total_score > 0 else 0
-    
+
     if best_score < 3:
         return "Belirsiz", "Belirsiz", "Belirsiz", 0, 0
-    
+
     return "Türkiye Fenotipleri", turkish_phenotypes[best_phenotype]['açıklama'], "", best_score, confidence
 
-# ===================================================================
-# 3. FLASK API (GÜNCELLENMİŞ VERSİYON)
-# ===================================================================
-
-app = Flask(__name__)
+# -------------------------------------------------------------------
+# 3. GLOBAL MEDIAPIPE / HELPER (PERFORMANCE & SAFETY)
+# -------------------------------------------------------------------
 mpfm = mp.solutions.face_mesh
+
+# create one FaceMesh instance per worker (refine_landmarks False => daha az bellek)
+# If you need iris features, consider a separate endpoint to run refine_landmarks selectively.
+face_mesh_instance = mpfm.FaceMesh(
+    static_image_mode=True,
+    max_num_faces=1,
+    refine_landmarks=False,  # >>> performans/memory için False önerilir
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+def resize_if_needed(img, max_w=900, max_h=900):
+    h, w = img.shape[:2]
+    if w <= max_w and h <= max_h:
+        return img
+    scale = min(max_w / float(w), max_h / float(h))
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+def build_result_from_image(img):
+    """
+    img: BGR numpy array (resized if needed)
+    returns: tuple (features, generalPhenotype..., turkishPhenotype...)
+    """
+    h, w = img.shape[:2]
+    # face_mesh_instance is global
+    res = face_mesh_instance.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    if not res or not getattr(res, 'multi_face_landmarks', None):
+        return None, 'Yüz tespit edilemedi'
+    lm = res.multi_face_landmarks[0].landmark
+
+    skin, skin_bgr = detect_skin_tone(img, lm)
+    face_length_ratio = detect_face_length_ratio(lm, w, h)
+    hair_texture = detect_hair_texture(img, lm)
+    lip_thickness = detect_lip_thickness(lm, h)
+
+    iris_landmarks = None
+    if len(lm) > 477:
+        try:
+            iris_landmarks = [lm[i] for i in range(473, 478)]
+        except Exception:
+            iris_landmarks = None
+
+    features = {
+        'Yüz Uzunluğu': face_length_ratio,
+        'Ten': skin,
+        'Göz': detect_eye_color(img, iris_landmarks),
+        'Saç': analyze_hair_status(img, lm, skin_bgr),
+        'Saç Şekli': hair_texture,
+        'Burun': detect_nose_shape(lm, w, h),
+        'Kaş': detect_eyebrow_shape(lm),
+        'Göz Şekli': detect_eye_shape(lm, w, h),
+        'Dudak': lip_thickness
+    }
+
+    main, sub, region, conf_main, conf_sub = classify_phenotype(features)
+    turkish_main, turkish_sub, turkish_regions, turkish_score, turkish_conf = classify_turkish_phenotype(features)
+
+    # cleanup
+    try:
+        del res, lm, iris_landmarks
+    except: pass
+    gc.collect()
+
+    return {
+        'features': features,
+        'generalPhenotype': {'mainCategory': main, 'subType': sub, 'regions': region, 'confidence': conf_main},
+        'turkishPhenotype': {'mainCategory': turkish_main, 'subType': turkish_sub, 'regions': turkish_regions, 'confidence': turkish_conf},
+    }, None
+
+# -------------------------------------------------------------------
+# 4. FLASK ENDPOINTS
+# -------------------------------------------------------------------
 
 @app.route('/analyze', methods=['POST'])
 def analyze_image():
+    # file presence
     if 'file' not in request.files:
         return jsonify({'error': 'Dosya bulunamadı'}), 400
 
     f = request.files['file']
     try:
         data = f.read()
+        if not data:
+            return jsonify({'error': 'Görüntü boş'}), 400
+        if len(data) > (MAX_UPLOAD_MB * 1024 * 1024):
+            return jsonify({'error': f'Dosya çok büyük. Maksimum {MAX_UPLOAD_MB} MB.'}), 413
+
         img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
         if img is None:
             return jsonify({'error': 'Görüntü okunamadı'}), 400
-        h, w, _ = img.shape
 
-        with mpfm.FaceMesh(
-            static_image_mode=True,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        ) as face_mesh:
-            res = face_mesh.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-            if not res.multi_face_landmarks or not res.multi_face_landmarks[0].landmark:
-                return jsonify({'error': 'Yüz tespit edilemedi'}), 400
+        # resize early to reduce mem/time
+        img = resize_if_needed(img, max_w=900, max_h=900)
 
-            lm = res.multi_face_landmarks[0].landmark
-
-            skin, skin_bgr = detect_skin_tone(img, lm)
-            
-            face_length_ratio = detect_face_length_ratio(lm, w, h)
-            hair_texture = detect_hair_texture(img, lm)
-            lip_thickness = detect_lip_thickness(lm, h)
-
-            iris_landmarks = None
-            if len(lm) > 477:
-                iris_landmarks = [lm[i] for i in range(473, 478)]
-
-            features = {
-                'Yüz Uzunluğu': face_length_ratio,
-                'Ten': skin,
-                'Göz': detect_eye_color(img, iris_landmarks),
-                'Saç': analyze_hair_status(img, lm, skin_bgr),
-                'Saç Şekli': hair_texture,
-                'Burun': detect_nose_shape(lm, w, h),
-                'Kaş': detect_eyebrow_shape(lm),
-                'Göz Şekli': detect_eye_shape(lm, w, h),
-                'Dudak': lip_thickness
-            }
-
-            if DEBUG: print("DEBUG FEATURES ->", features)
-
-            # Hem genel fenotip hem de Türkiye fenotiplerini sınıflandır
-            main, sub, region, conf_main, conf_sub = classify_phenotype(features)
-            
-            turkish_main, turkish_sub, turkish_regions, turkish_score, turkish_conf = classify_turkish_phenotype(features)
-
-            if DEBUG: 
-                print("DEBUG GENERAL CLASS ->", main, sub, "conf:", conf_main, conf_sub)
-                print("DEBUG TURKISH CLASS ->", turkish_main, turkish_sub, "conf:", turkish_conf)
-
-            del res, lm, iris_landmarks
+        # process with mediapipe (catch MemoryError separately)
+        try:
+            result_json, err = build_result_from_image(img)
+            if err:
+                return jsonify({'error': err}), 400
+            return jsonify(result_json), 200
+        except MemoryError as me:
+            current_app.logger.exception('MemoryError during processing')
             gc.collect()
-
-            return jsonify({
-                'features': features,
-                'generalPhenotype': {'mainCategory': main, 'subType': sub, 'regions': region, 'confidence': conf_main},
-                'turkishPhenotype': {'mainCategory': turkish_main, 'subType': turkish_sub, 'regions': turkish_regions, 'confidence': turkish_conf},
-            }), 200
+            return jsonify({'error': 'Sunucu kaynak yetersiz (MemoryError)'}), 503
+        except Exception as e:
+            current_app.logger.exception('Exception during processing')
+            traceback.print_exc()
+            gc.collect()
+            return jsonify({'error': 'Analiz hatası: ' + str(e)}), 500
 
     except Exception as e:
         traceback.print_exc()
+        current_app.logger.exception('Unhandled exception in analyze_image')
+        gc.collect()
         return jsonify({'error': 'Analiz hatası: ' + str(e)}), 500
 
+@app.route('/analyze_base64', methods=['POST'])
+def analyze_base64():
+    """
+    Fallback endpoint: istemci base64 gönderirse kullan.
+    Body: {"image_base64": "..."}
+    """
+    try:
+        data = request.get_json(silent=True)
+        if not data or 'image_base64' not in data:
+            return jsonify({'error': 'image_base64 required'}), 400
 
+        b64 = data['image_base64']
+        if not isinstance(b64, str) or len(b64) < 10:
+            return jsonify({'error': 'image_base64 invalid'}), 400
+
+        try:
+            img_bytes = base64.b64decode(b64)
+        except Exception as e:
+            return jsonify({'error': 'base64 decode failed: ' + str(e)}), 400
+
+        if len(img_bytes) > (MAX_UPLOAD_MB * 1024 * 1024):
+            return jsonify({'error': f'Dosya çok büyük. Maksimum {MAX_UPLOAD_MB} MB.'}), 413
+
+        img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return jsonify({'error': 'Görüntü okunamadı'}), 400
+
+        img = resize_if_needed(img, max_w=900, max_h=900)
+
+        try:
+            result_json, err = build_result_from_image(img)
+            if err:
+                return jsonify({'error': err}), 400
+            return jsonify(result_json), 200
+        except MemoryError:
+            current_app.logger.exception('MemoryError in base64 endpoint')
+            gc.collect()
+            return jsonify({'error': 'Sunucu kaynak yetersiz (MemoryError)'}), 503
+        except Exception as e:
+            current_app.logger.exception('Exception in base64 endpoint')
+            traceback.print_exc()
+            gc.collect()
+            return jsonify({'error': 'Analiz hatası: ' + str(e)}), 500
+
+    except Exception as e:
+        traceback.print_exc()
+        current_app.logger.exception('Unhandled exception in analyze_base64')
+        gc.collect()
+        return jsonify({'error': 'Analiz hatası: ' + str(e)}), 500
+
+# Health check
+@app.route('/', methods=['GET'])
+def index():
+    return jsonify({'status': 'ok', 'max_upload_mb': MAX_UPLOAD_MB}), 200
+
+# -------------------------------------------------------------------
+# 5. RUN (development)
+# -------------------------------------------------------------------
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    # dev run
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=DEBUG)
